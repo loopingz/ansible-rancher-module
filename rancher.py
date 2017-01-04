@@ -34,6 +34,10 @@ options:
         description:
             - List of catalogs you want to install: list of map(url,name,[branch])
         required: false
+    clean_catalogs:
+        description:
+            - Remove any catalogs that are not specified ( default=False )
+        required: false
     environments:
         description:
             - List of environments you want to have: list of map(name,stacks)
@@ -41,16 +45,26 @@ options:
             - answers are a list of map(name,value)
             - catalog_entry is format CatalogName:TemplateName[:Version]
         required: false
+    clean_envs:
+        description:
+            - Remove any envs that are not specified ( default=False )
+        required: false
+    clean_stacks:
+        description:
+            - Remove any stacks that are not specified ( default=False )
+        required: false
 '''
 
 
 class ProjectAutomationClient(gdapi.Client):
 
-    def __init__(self, root_client, project_id, *args, **kwargs):
+    def __init__(self, url, root_client, project_id, *args, **kwargs):
         self._project_id = project_id
         self._root_client = root_client
         self._init = False
-        url = 'https://rancherdev.io.nuxeo.com/v2-beta/projects/' + project_id
+        if url[-1] != '/':
+            url += '/'
+        url += 'v2-beta/projects/' + project_id
         super(ProjectAutomationClient, self).__init__(url=url, *args, **kwargs)
 
     def _load_schemas(self, *args, **kwargs):
@@ -59,7 +73,7 @@ class ProjectAutomationClient(gdapi.Client):
         super(ProjectAutomationClient, self)._load_schemas(*args, **kwargs)
 
     def __enter__(self):
-        print "Creating key for environment"
+        # Creating key for environment
         key_name = 'io-deploy-automation'
         self._key = self._root_client.create_api_key({'accountId': self._project_id, 'name': key_name})
         self._access_key = self._key.publicValue
@@ -70,21 +84,21 @@ class ProjectAutomationClient(gdapi.Client):
             try:
                 self._load_schemas()
             except gdapi.ApiError:
-                print "Wait until key is active"
+                # Wait until key is active
                 sleep(1)
                 continue
             break
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        print "Desactivate environment API key"
+        # Desactivate environment API key
         self._key = self._root_client._post(self._key.links.self + "?action=deactivate")
-        print "Remove environment API key"
+        # Remove environment API key
         while True:
             try:
                 self._root_client.delete(self._key)
             except gdapi.ApiError:
-                print "Wait until key is deactived"
+                # Wait until key is deactived
                 sleep(1)
                 continue
             break
@@ -116,10 +130,11 @@ class RancherAnsibleModule(AnsibleModule):
             stack['definition']['startOnCreate'] = stack['startOnCreate']
         else:
             stack['definition']['startOnCreate'] = True
+        stack['definition']['environment'] = dict()
+        # Inject any additional environment
         if 'answers' in stack:
-            stack['definition']['environment'] = stack['answers']
-        else:
-            stack['definition']['environment'] = dict()
+            for answer in stack['answers']:
+                stack['definition']['environment'][answer['name']] = answer['value']
 
         if 'catalog_entry' in stack:
             # Load catalog
@@ -145,12 +160,16 @@ class RancherAnsibleModule(AnsibleModule):
             stack['definition']['dockerCompose'] = stack['docker_compose']
 
     def equals_stack(self, expected_stack, stack):
-        return expected_stack['definition']['dockerCompose'] == stack.dockerCompose and \
-                expected_stack['definition']['rancherCompose'] == stack.rancherCompose and \
-                expected_stack['definition']['environment'] == stack.environment
+        if not (expected_stack['definition']['dockerCompose'] == stack.dockerCompose and \
+                expected_stack['definition']['rancherCompose'] == stack.rancherCompose):
+            return False
+        for key, value in expected_stack['definition']['environment'].items():
+            if stack.environment[key] != value:
+                return False
+        return True
 
     def check_environment(self, env, expected_env):
-        with ProjectAutomationClient(self._account_client, env.id) as client:
+        with ProjectAutomationClient(self.params['url'], self._account_client, env.id) as client:
             stacks = client.list_stack().data
             adds = []
             updates = []
@@ -165,14 +184,14 @@ class RancherAnsibleModule(AnsibleModule):
                         found = True
                         # Check modification
                         if not self.equals_stack(expected_stack, stack):
-                            expected_stack.current = stack
+                            expected_stack['current'] = stack.links.self
                             updates.append(expected_stack)
                         break
                 if found:
                     continue
                 adds.append(expected_stack)
             removes = []
-            if self.params['clean']:
+            if self.params['clean_stacks']:
                 for stack in stacks:
                     if not stack.name in names:
                         removes.append(stack)
@@ -189,10 +208,22 @@ class RancherAnsibleModule(AnsibleModule):
             # Check mode don't actually update stuffs
             if self.check_mode:
                 return result
+            # Launch update process
+            for stack in updates:
+                client._post(stack['current'] + "?action=upgrade", stack['definition'])
+            for stack in updates:
+                current = client._get(stack['current'])
+                while current.state == 'upgrading':
+                    sleep(1)
+                    current = client.reload(current)
+                if current.state == 'upgraded':
+                    client._post(stack['current'] + "?action=finishupgrade")
+                else:
+                    raise Exception("Cant update the stack " + stack['current'])
+
+            # Adding stack
             for stack in adds:
-                #client.create_stack(stack['definition'])
-                #self.log("add stack: %r" % (stack,))
-                pass
+                client.create_stack(stack['definition'])
         return result
 
     def check_environments(self, expected_envs):
@@ -216,7 +247,7 @@ class RancherAnsibleModule(AnsibleModule):
             adds.append(expected_env)
         removes = []
         # If in clean mode remove the unwanted environments
-        if self.params['clean']:
+        if self.params['clean_envs']:
             for env in envs:
                 if not env.name in names:
                     removes.append(env)
@@ -263,7 +294,7 @@ class RancherAnsibleModule(AnsibleModule):
 
         removes = []
         # If in clean mode remove the unwanted catalogs
-        if self.params['clean']:
+        if self.params['clean_catalogs']:
             for key, catalog in catalogs.iteritems():
                 if not catalog[u'url'] in urls:
                     removes.append(catalog)
@@ -316,7 +347,9 @@ def main():
             url      = dict(required=True),
             access_key=dict(required=True),
             secret_key=dict(required=True),
-            clean=dict(default=False,type='bool'),
+            clean_envs=dict(default=False,type='bool'),
+            clean_catalogs=dict(default=False, type='bool'),
+            clean_stacks=dict(default=False, type='bool'),
             catalogs = dict(type='list'),
             environments = dict(type='list')
         ),
