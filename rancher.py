@@ -107,6 +107,7 @@ class ProjectAutomationClient(gdapi.Client):
 class RancherAnsibleModule(AnsibleModule):
     def __init__(self, *args, **kwargs):
         self._output = []
+        self._facts = dict()
         self._account_client = None
         self._catalog_client = None
         super(RancherAnsibleModule, self).__init__(*args, **kwargs)
@@ -226,11 +227,23 @@ class RancherAnsibleModule(AnsibleModule):
                 client.create_stack(stack['definition'])
         return result
 
+    def get_environment_token(self, env, iter=0):
+        tokens = self._account_client._get(env.links['registrationTokens']).data
+
+        if len(tokens) > 0:
+            self.log("tokens: %r" % (tokens[0].token))
+            return tokens[0].token
+        else:
+            if (iter > 3):
+                raise Exception('Cannot create environment token')
+            self._account_client._post(env.links['registrationTokens'][:-1])
+            sleep(1)
+            return self.get_environment_token(env, iter=iter+1)
+
     def check_environments(self, expected_envs):
         # Get environments
         envs = self._account_client.list_project().data
         adds = []
-        updates = []
         names = []
         result = False
         for expected_env in expected_envs:
@@ -246,12 +259,16 @@ class RancherAnsibleModule(AnsibleModule):
                 continue
             adds.append(expected_env)
         removes = []
+        self._facts["envs"] = dict()
         # If in clean mode remove the unwanted environments
-        if self.params['clean_envs']:
-            for env in envs:
-                if not env.name in names:
+        for env in envs:
+            if not env.name in names:
+                if self.params['clean_envs']:
                     removes.append(env)
-        result |= (len(removes) + len(adds) + len(updates)) != 0
+                    continue
+            self._facts["envs"][env.name] = dict()
+            self._facts["envs"][env.name]["token"] = self.get_environment_token(env)
+        result |= (len(removes) + len(adds)) != 0
         # Check mode don't actually update stuffs
         if self.check_mode:
             return result
@@ -260,6 +277,8 @@ class RancherAnsibleModule(AnsibleModule):
             created_env = self._account_client.create_project({'name': env['name']})
             # Add the stack now
             self.check_environment(created_env, env)
+            self._facts["envs"][created_env.name] = dict()
+            self._facts["envs"][created_env.name]["token"] = self.get_environment_token(created_env)
         # Remove additional environment
         for env in removes:
             self._account_client.delete(env)
@@ -336,9 +355,10 @@ class RancherAnsibleModule(AnsibleModule):
                 changed |= self.check_catalogs(self.params['catalogs'])
             if 'environments' in self.params:
                 changed |= self.check_environments(self.params['environments'])
-            self.exit_json(changed=changed, output=self._output, catalogs=self._catalogs)
+            self.exit_json(changed=changed, ansible_facts={'rancher': self._facts},
+                                output=self._output, catalogs=self._catalogs)
         except Exception as e:
-            self.fail_json(e.message)
+            self.fail_json(msg=e.message)
 
 
 def main():

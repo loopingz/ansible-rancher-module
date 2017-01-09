@@ -26,6 +26,9 @@ You can configure the stacks, the environments and the catalogs.
                 answers:
                   - name: 'FREQUENCY'
                     value: '9200'
+    - name: 'Display Registration Token'
+      debug:
+        msg: "Rancher Production Token is {{ rancher.envs.Production.token }}"
 ```
 
 This playbook will :
@@ -33,6 +36,7 @@ This playbook will :
 - Add or update a catalog named MyCatalog with repository (https://.../rancher-catalog.git) on master branch
 - Add a Production environment if it doesn't exist
 - Add or update a Janitor stack based on the Janitor item of the catalog MyCatalog, with variable FREQUENCY set to 9200
+- Gather fact in rancher.envs with registration token
 
 **Parameters**
 
