@@ -117,7 +117,8 @@ class RancherAnsibleModule(AnsibleModule):
 
     def get_catalog_template(self, catalog, template):
         for entry in self.list_catalog(catalog):
-            if entry.name == template:
+            path = entry.path.split('/')
+            if path[1] == template:
                 return entry
         return None
 
@@ -231,7 +232,6 @@ class RancherAnsibleModule(AnsibleModule):
         tokens = self._account_client._get(env.links['registrationTokens']).data
 
         if len(tokens) > 0:
-            self.log("tokens: %r" % (tokens[0].token))
             return tokens[0].token
         else:
             if (iter > 3):

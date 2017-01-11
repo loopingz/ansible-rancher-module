@@ -87,7 +87,7 @@ answers:
 *name* of the stack
 
 *catalog_entry* or (*rancher_compose* and *docker_compose*) to specify the stack
-*catalog_entry* use CatalogName:TemplateName format, it will load the rancher_compose and docker_compose from the catalog. Or you can directly define your composes
+*catalog_entry* use CatalogName:TemplateKey format, it will load the rancher_compose and docker_compose from the catalog. Or you can directly define your composes. You can find the templateKey when browsing to the item : https://rancherurl/env/1a5/catalog/Arken:infra\*datadog?catalogId=Arken, the key is infra\*datadog
 
 *answers* the different values to use for rancher compose, list of (*name*, *value*)
 
