@@ -117,8 +117,7 @@ class RancherAnsibleModule(AnsibleModule):
 
     def get_catalog_template(self, catalog, template):
         for entry in self.list_catalog(catalog):
-            path = entry.path.split('/')
-            if path[1] == template:
+            if entry.folderName == template:
                 return entry
         return None
 
