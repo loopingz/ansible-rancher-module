@@ -2,6 +2,7 @@
 from ansible.module_utils.basic import AnsibleModule
 import gdapi
 import json
+import urllib2, base64
 from time import sleep
 
 DOCUMENTATION = '''
@@ -53,6 +54,17 @@ options:
         description:
             - Remove any stacks that are not specified ( default=False )
         required: false
+    github_user:
+        description:
+            - Github user to authenticate calls
+        required: false
+    github_password:
+        description:
+            - Github password to authenticate calls
+    clean_hosts:
+        description:
+            - Remove any hosts that are marked as disconected in Rancher( default=False )
+        required: false          
 '''
 
 
@@ -121,7 +133,7 @@ class RancherAnsibleModule(AnsibleModule):
                 return entry
         return None
 
-    def init_stack(self, stack):
+    def init_stack(self, stack, stack_params):
         stack['definition'] = dict()
         stack['definition']['name'] = stack['name']
         stack['definition']['type'] = 'stack'
@@ -136,6 +148,8 @@ class RancherAnsibleModule(AnsibleModule):
         if 'answers' in stack:
             for answer in stack['answers']:
                 stack['definition']['environment'][answer['name']] = answer['value']
+                if answer['name'] == stack_params['name']:
+                    stack['definition']['environment'][answer['name']] = stack_params['value']
 
         if 'catalog_entry' in stack:
             # Load catalog
@@ -152,6 +166,9 @@ class RancherAnsibleModule(AnsibleModule):
             template = self._catalog_client.by_id_template(url[url.rindex('/') + 1:])
             stack['definition']['rancherCompose'] = template.files['rancher-compose.yml']
             stack['definition']['dockerCompose'] = template.files['docker-compose.yml']
+            
+            if infos[1].startswith('infra*'):
+                stack['definition']['system'] = True
         elif not ('docker_compose' in stack and 'rancher_compose' in stack):
             # Check arguments failed
             raise Exception('Stack need to have either catalog_entry or docker_compose and rancher_compose')
@@ -169,16 +186,17 @@ class RancherAnsibleModule(AnsibleModule):
                 return False
         return True
 
-    def check_environment(self, env, expected_env):
+    def check_stacks(self, env, expected_env):
         with ProjectAutomationClient(self.params['url'], self._account_client, env.id) as client:
             stacks = client.list_stack().data
             adds = []
             updates = []
             names = []
             result = False
+            stack_parameters = expected_env['stack_parameters']
             for expected_stack in expected_env['stacks']:
                 names.append(expected_stack['name'])
-                self.init_stack(expected_stack)
+                self.init_stack(expected_stack, stack_parameters)
                 found = False
                 for stack in stacks:
                     if stack.name == expected_stack['name']:
@@ -239,20 +257,67 @@ class RancherAnsibleModule(AnsibleModule):
             sleep(1)
             return self.get_environment_token(env, iter=iter+1)
 
+    def need_members_update(self, current, expected):
+        if current is None:
+            return True
+        members = dict()
+        for member in current:
+            key = member['externalId']+member['externalIdType']
+            members[key] = member.role
+        for member in expected:
+            key = member['externalId'] + member['externalIdType']
+            # New member or new role
+            if key not in members or members[key] != member['role']:
+                return True
+            # Remove this member from the list
+            del members[key]
+        return len(members) > 0
+
+
+    def remove_disconnected_hosts(self):
+        envs = self._account_client.list_project(all=True).data  
+        for env in envs:     
+            with ProjectAutomationClient(self.params['url'], self._account_client, env.id) as client:
+            #get hosts for each env
+                hosts = client._get(env.links['hosts']).data
+                for host in hosts:
+                    if host.state == 'disconnected':
+                        client._post(host.links.self + "?action=deactivate")
+                for host in hosts:
+                    host =  client._get(host.links.self)
+                    if host.state == 'inactive':
+                        client._delete(host.links.self)       
+ 
+
+
     def check_environments(self, expected_envs):
         # Get environments
-        envs = self._account_client.list_project().data
+        envs = self._account_client.list_project(all=True).data
         adds = []
+        updates = []
         names = []
         result = False
         for expected_env in expected_envs:
             names.append(expected_env['name'])
+            # Generate the members for the project
+            members = []
+            if 'members' in expected_env:
+                for member in expected_env['members']:
+                    info = self.load_user(member)
+                    info['role'] = member['role']
+                    info['type'] = 'projectMember'
+                    members.append(info)
+            expected_env['compute_members'] = members
             found = False
             for env in envs:
                 if env.name == expected_env['name']:
+                    if self.need_members_update(env.members, members):
+                        expected_env['current'] = env
+                        updates.append(expected_env)
                     found = True
                     # Check environment
-                    result |= self.check_environment(env, expected_env)
+                    if 'stacks' in expected_env:
+                       result |= self.check_stacks(env, expected_env)
                     break
             if found:
                 continue
@@ -267,17 +332,24 @@ class RancherAnsibleModule(AnsibleModule):
                     continue
             self._facts["envs"][env.name] = dict()
             self._facts["envs"][env.name]["token"] = self.get_environment_token(env)
+            self._facts["envs"][env.name]["id"] = env.id
         result |= (len(removes) + len(adds)) != 0
         # Check mode don't actually update stuffs
         if self.check_mode:
             return result
         # Create missing environment
         for env in adds:
-            created_env = self._account_client.create_project({'name': env['name']})
+            created_env = self._account_client.create_project({'name': env['name'], 'members': env['compute_members']})
             # Add the stack now
-            self.check_environment(created_env, env)
+            if 'stacks' in env:
+               self.check_stacks(created_env, env)
             self._facts["envs"][created_env.name] = dict()
             self._facts["envs"][created_env.name]["token"] = self.get_environment_token(created_env)
+            self._facts["envs"][env.name]["id"] = env.id
+        # Handle update of member for an environment
+        for env in updates:
+            self._account_client.action(env['current'], 'setmembers', members=env['compute_members'])
+            del env['current']
         # Remove additional environment
         for env in removes:
             self._account_client.delete(env)
@@ -285,12 +357,18 @@ class RancherAnsibleModule(AnsibleModule):
 
     def check_catalogs(self, expected_catalogs):
         # Get catalog settings
-        catalog_url_id = '1as17'
+        catalog_url_id = 'catalog.url'
         setting = self._account_client.by_id_setting(catalog_url_id)
-        catalogs = json.loads(setting.value)['catalogs']
+        if setting.value[0] != '{':
+            # Default value for catalogs is not JSON
+            # u'community=https://git.rancher.io/community-catalog.git,library=https://git.rancher.io/rancher-catalog.git'
+            catalogs = dict()
+            for ctl in [ctl.split('=') for ctl in setting.value.split(',')]:
+                catalogs[ctl[0]] = {'url': ctl[1]}
+        else:
+            catalogs = json.loads(setting.value)['catalogs']
         urls = []
         adds = []
-        updates = []
         # Verify if expected catalogs already exists or need updates
         for expected_catalog in expected_catalogs:
             urls.append(expected_catalog['url'])
@@ -301,7 +379,7 @@ class RancherAnsibleModule(AnsibleModule):
             for key, catalog in catalogs.iteritems():
                 if expected_catalog['url'] == catalog['url'] or expected_catalog['name'] == key:
                     found = True
-                    if expected_catalog['url'] == catalog['url'] and expected_catalog['name'] == key\
+                    if expected_catalog['url'] == catalog['url'] and expected_catalog['name'] == key \
                             and expected_catalog['branch'] == catalog['branch']:
                         break
                     updates.append(expected_catalog)
@@ -344,33 +422,116 @@ class RancherAnsibleModule(AnsibleModule):
     def process(self):
         try:
             changed = False
+            if self.params['create_keys'] is not None and self.params['access_key'] is None:
+                if self.check_mode:
+                    self.exit_json(changed=True)
+                    return
+                client = gdapi.Client(url=self.params['url'] + 'v2-beta/')
+                name = 'Ansible Key'
+                description = 'Created by Ansible Rancher module'
+                if self.params['create_keys'] != "True":
+                    try:
+                        params = eval(self.params['create_keys'])
+                        if 'name' in params:
+                            name = params['name']
+                        if 'description' in params:
+                            description = params['description']
+                    except:
+                        self.log('exception')
+                        pass
+                main_key = client.create('apiKey', name=name, description=description)
+                self.params['access_key'] = main_key['publicValue']
+                self.params['secret_key'] = main_key['secretValue']
+            self._facts['api_key'] = {'secret_key': self.params['secret_key'], 'access_key': self.params['access_key']}
             self._account_client = gdapi.Client(url=self.params['url'] + 'v2-beta/',
-                                                    access_key=self.params['access_key'],
-                                                    secret_key=self.params['secret_key'])
-            self._catalog_client = gdapi.Client(url=self.params['url'] + 'v1-catalog/',
                                                 access_key=self.params['access_key'],
                                                 secret_key=self.params['secret_key'])
-            if 'catalogs' in self.params:
+            self._catalog_client = gdapi.Client(url=self.params['url'] + 'v1-catalog/',
+                                                    access_key=self.params['access_key'],
+                                                    secret_key=self.params['secret_key'])
+            if self.params['catalogs'] is not None:
                 changed |= self.check_catalogs(self.params['catalogs'])
-            if 'environments' in self.params:
+            if self.params['environments'] is not None:
+                ## not that nice, but no point in updating the envs when cleaning 
                 changed |= self.check_environments(self.params['environments'])
-            self.exit_json(changed=changed, ansible_facts={'rancher': self._facts},
-                                output=self._output, catalogs=self._catalogs)
+            if self.params['clean_hosts']:
+                self.remove_disconnected_hosts()    
+            if self.params['setup_auth'] is not None:
+                self.setup_auth(self._account_client, self.params['setup_auth'])
+            self.exit_json(changed=changed, ansible_facts={self.params['var']: self._facts}, output=self._output)
+        except urllib2.HTTPError as e:
+            error_message = e.read()
+            self.fail_json(msg=error_message)
         except Exception as e:
             self.fail_json(msg=e.message)
+            
+
+    def load_user(self, user):
+        if user['type'] == 'github':
+            return self.get_github_identity(user['id'])
+        return None
+
+    def setup_auth(self, client, params):
+        if self.check_mode:
+            return
+        if params['type'] == 'github':
+            cfg = dict()
+            cfg['type'] = 'config'
+            cfg['provider'] = 'githubconfig'
+            if 'disable' not in params:
+                params['disable'] = False
+            cfg['enabled'] = not params['disable']
+            if 'access_mode' not in params:
+                params['access_mode'] = 'required'
+            cfg['accessMode'] = params['access_mode']
+            if 'users' not in params:
+                params['users'] = []
+            cfg['allowedIdentities'] = [self.get_github_identity(user) for user in params['users']]
+            cfg['githubConfig'] = {'hostname': '', 'type': 'githubconfig', 'scheme': 'https',
+                                   'clientId': params['client_id'],
+                                   'clientSecret': params['client_secret']}
+            try:
+                client._post(self.params['url'] + 'v1-auth/config', data=cfg)
+            except AttributeError:
+                # Cannot parse the None result
+                pass
+
+    def get_github_identity(self, name):
+        request = urllib2.Request("https://api.github.com/users/" + name)
+        
+        if self.params['github_user'] != '' and self.params['github_password'] != '':
+           base64string = base64.encodestring('%s:%s' % (self.params['github_user'], self.params['github_password'])).replace('\n', '')
+           request.add_header("Authorization", "Basic %s" % base64string)
+        
+        user = json.loads(urllib2.urlopen(request).read())
+        res = dict()
+        res['externalId'] = str(user['id'])
+        if user['type'] == 'User':
+            res['externalIdType'] = 'github_user'
+        else:
+            res['externalIdType'] = 'github_org'
+        res['type'] = 'identity'
+        res['id'] = res['externalIdType'] + ':' + res['externalId']
+        return res
 
 
 def main():
     RancherAnsibleModule(
-        argument_spec = dict(
-            url      = dict(required=True),
-            access_key=dict(required=True),
-            secret_key=dict(required=True),
+        argument_spec=dict(
+            url=dict(required=True),
+            create_keys=dict(default=False),
+            setup_auth=dict(type='dict', required=False),
+            var=dict(required=False, default="rancher"),
+            access_key=dict(required=False),
+            secret_key=dict(required=False),
             clean_envs=dict(default=False,type='bool'),
             clean_catalogs=dict(default=False, type='bool'),
             clean_stacks=dict(default=False, type='bool'),
-            catalogs = dict(type='list'),
-            environments = dict(type='list')
+            clean_hosts=dict(default=False, type='bool'),
+            catalogs=dict(type='list'),
+            environments=dict(required=False, type='list'),
+            github_user=dict(required=False),
+            github_password=dict(required=False),
         ),
         supports_check_mode=True
     ).process()
